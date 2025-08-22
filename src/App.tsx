@@ -396,7 +396,7 @@ export default function HotlineMap() {
   // Adaptive: if a lot of points, skip extra densification (1) to keep GPU + JS light.
   const DENSE_LIMIT = 5000; // if points > this, no artificial subdivision
   const SUBDIVISIONS = points.length > DENSE_LIMIT ? 1 : 6;
-  const HOVER_PIXEL_TOLERANCE = 15; // consistent visual radius
+  const HOVER_PIXEL_TOLERANCE = 40; // wider hover radius in pixels
   const mapRef = useRef<maplibregl.Map | null>(null);
   const [nearestPoint, setNearestPoint] = useState<NearestResult | null>(null);
   const [tooltip, setTooltip] = useState<{ x: number; y: number } | null>(null);
@@ -505,7 +505,7 @@ export default function HotlineMap() {
             radiusUnits: "pixels",
             stroked: true,
             filled: true,
-            getFillColor: [255, 255, 255, 180],
+            getFillColor: [255, 255, 255, 200],
             getLineColor: [0, 0, 0, 230],
             lineWidthMinPixels: 2,
             pickable: false,
