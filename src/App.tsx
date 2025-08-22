@@ -23,7 +23,7 @@ interface Point {
 // --- Realistic route fetch (Moscow -> St. Petersburg) using OSRM public demo server ---
 // NOTE: Public demo server has rate limits; for production, self-host OSRM or use a routing provider.
 const ROUTE_START: [number, number] = [37.617635, 55.755814]; // Moscow (lon, lat)
-const ROUTE_END: [number, number] = [82.92043, 55.0302]; // Novosibirsk center
+const ROUTE_END: [number, number] = [131.885, 43.115]; // Vladivostok (lon, lat)
 
 function haversineKm(a: [number, number], b: [number, number]) {
   const R = 6371;
