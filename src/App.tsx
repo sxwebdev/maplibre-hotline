@@ -3,6 +3,14 @@ import DeckGL from "@deck.gl/react";
 import { PathLayer, ScatterplotLayer } from "@deck.gl/layers";
 import { Map } from "react-map-gl/maplibre";
 import maplibregl from "maplibre-gl";
+import {
+  generateRandomEvents,
+  buildClusterIndex,
+  composeClusterRenderable,
+  buildClusterLayers,
+  computeBbox,
+  type EventPoint,
+} from "./clusterUtil";
 
 /**
  * Quick start:
@@ -149,6 +157,70 @@ export default function HotlineMap() {
   const [tooltip, setTooltip] = useState<{ x: number; y: number } | null>(null);
   const tooltipRef = useRef<HTMLDivElement | null>(null);
 
+  // ---- Clustering demo state ----
+  const [events] = useState<EventPoint[]>(() =>
+    generateRandomEvents(15000, [60, 56], 15)
+  );
+  const clusterIndex = useMemo(
+    () => buildClusterIndex(events, { radius: 50, maxZoom: 16, minPoints: 2 }),
+    [events]
+  );
+  const [clusterZoom, setClusterZoom] = useState<number>(3);
+  const [clusterData, setClusterData] = useState(() =>
+    composeClusterRenderable(clusterIndex, computeBbox(60, 56, 80), clusterZoom)
+  );
+  const [activeClusterId, setActiveClusterId] = useState<number | null>(null);
+  const [clusterLeaves, setClusterLeaves] = useState<EventPoint[]>([]);
+  const [leavesLoading, setLeavesLoading] = useState(false);
+  const [clusterPanelPos, setClusterPanelPos] = useState<{
+    x: number;
+    y: number;
+  } | null>(null);
+
+  // Cluster updates with change detection to avoid infinite update loops
+  const prevClusterState = useRef<{
+    zoom: number;
+    bbox: [number, number, number, number];
+    hash: string;
+  } | null>(null);
+  const updateClusters = useCallback(
+    (map?: maplibregl.Map) => {
+      const m = map || mapRef.current;
+      if (!m) return;
+      const b = m.getBounds();
+      const z = m.getZoom();
+      const bbox: [number, number, number, number] = [
+        b.getWest(),
+        b.getSouth(),
+        b.getEast(),
+        b.getNorth(),
+      ];
+      const prev = prevClusterState.current;
+      // Simple bbox + zoom equality check
+      const sameZoom = prev && Math.abs(prev.zoom - z) < 1e-6;
+      const sameBbox =
+        prev &&
+        Math.abs(prev.bbox[0] - bbox[0]) < 1e-6 &&
+        Math.abs(prev.bbox[1] - bbox[1]) < 1e-6 &&
+        Math.abs(prev.bbox[2] - bbox[2]) < 1e-6 &&
+        Math.abs(prev.bbox[3] - bbox[3]) < 1e-6;
+      if (sameZoom && sameBbox) return; // nothing changed
+      const renderable = composeClusterRenderable(clusterIndex, bbox, z);
+      // Build a hash of ids to avoid state update if identical content
+      const newHash = renderable
+        .map((d) => `${d.id}:${d.pointCount}`)
+        .join("|");
+      if (prev && prev.hash === newHash) {
+        prevClusterState.current = { zoom: z, bbox, hash: newHash }; // update bbox/zoom refs only
+        return;
+      }
+      prevClusterState.current = { zoom: z, bbox, hash: newHash };
+      setClusterZoom(z);
+      setClusterData(renderable);
+    },
+    [clusterIndex]
+  );
+
   // Build densified segments and compute min/max speed
   const customMin = 0; // configurable
   const customMax = 120; // configurable
@@ -250,7 +322,8 @@ export default function HotlineMap() {
       getColor: (d) => speedToColor(d.speed),
       getWidth: 6,
       widthUnits: "pixels",
-      rounded: true,
+      capRounded: true,
+      jointRounded: true,
       pickable: false,
     }),
     ...(nearestPoint
@@ -270,6 +343,18 @@ export default function HotlineMap() {
           }),
         ]
       : []),
+    // Cluster layers (events)
+    ...buildClusterLayers({
+      data: clusterData,
+      idPrefix: "evt",
+      clusterRadiusPx: 20,
+      clusterBorderPx: 6,
+      clusterFillColor: [255, 255, 255, 255],
+      clusterBorderColor: [59, 130, 246, 255], // blue-500
+      singlePointRadius: 3,
+      singlePointColor: [59, 130, 246, 180],
+      textColor: [55, 65, 81, 255],
+    }),
   ];
 
   return (
@@ -278,6 +363,72 @@ export default function HotlineMap() {
         initialViewState={initialViewState}
         controller={true}
         layers={layers}
+        onClick={(info: { object?: unknown; x: number; y: number }) => {
+          type ClickedObj = { id?: string | number; isCluster?: boolean };
+          const obj = info.object as ClickedObj | undefined;
+          if (!obj || !obj.isCluster || typeof obj.id === "undefined") return;
+          const clusterIdNum = Number(obj.id);
+          if (!Number.isFinite(clusterIdNum)) return;
+          if (activeClusterId === clusterIdNum) {
+            setActiveClusterId(null);
+            setClusterLeaves([]);
+            setClusterPanelPos(null);
+            return;
+          }
+          setActiveClusterId(clusterIdNum);
+          setLeavesLoading(true);
+          const clickX = info.x;
+          const clickY = info.y;
+          if (typeof clickX === "number" && typeof clickY === "number") {
+            setClusterPanelPos({ x: clickX, y: clickY });
+          } else {
+            setClusterPanelPos(null);
+          }
+          type Position = number[];
+          interface LeafFeature {
+            id?: string | number;
+            properties?: { value?: number; name?: string };
+            geometry: { coordinates: Position };
+          }
+          const gathered: EventPoint[] = [];
+          let offset = 0;
+          const PAGE = 50;
+          try {
+            while (offset < 1000) {
+              const batch = clusterIndex.getLeaves(
+                clusterIdNum,
+                PAGE,
+                offset
+              ) as unknown as LeafFeature[];
+              if (!batch.length) break;
+              for (const l of batch) {
+                const name = l.properties?.name || (l.id ?? "leaf").toString();
+                const coords = l.geometry.coordinates;
+                if (
+                  Array.isArray(coords) &&
+                  coords.length >= 2 &&
+                  typeof coords[0] === "number" &&
+                  typeof coords[1] === "number"
+                ) {
+                  const lon = coords[0];
+                  const lat = coords[1];
+                  gathered.push({
+                    id: (l.id ?? "leaf").toString(),
+                    lon,
+                    lat,
+                    value: l.properties?.value,
+                    name,
+                  });
+                }
+              }
+              if (batch.length < PAGE) break;
+              offset += PAGE;
+            }
+            setClusterLeaves(gathered);
+          } finally {
+            setLeavesLoading(false);
+          }
+        }}
         onHover={(pi) => {
           const { coordinate, x, y, viewport } = pi as unknown as {
             coordinate?: number[];
@@ -302,6 +453,8 @@ export default function HotlineMap() {
           mapStyle="https://basemaps.cartocdn.com/gl/positron-gl-style/style.json"
           onLoad={(e: { target: maplibregl.Map }) => {
             mapRef.current = e.target;
+            updateClusters(e.target);
+            e.target.on("moveend", () => updateClusters());
           }}
         />
       </DeckGL>
@@ -370,7 +523,72 @@ export default function HotlineMap() {
           Min: {Number.isFinite(minSpeed) ? minSpeed.toFixed(1) : "-"} · Max:{" "}
           {Number.isFinite(maxSpeed) ? maxSpeed.toFixed(1) : "-"}
         </div>
+        <div className="mt-3 pt-3 border-t text-xs text-gray-700 space-y-1">
+          <div className="font-medium">Clusters</div>
+          <div>Total events: {events.length.toLocaleString()}</div>
+          <div>Visible items: {clusterData.length}</div>
+        </div>
       </div>
+      {activeClusterId != null &&
+        clusterPanelPos &&
+        (() => {
+          const PAD = 6;
+          const PANEL_W = 260;
+          const PANEL_H = 400; // max height constraint for placement calculations
+          let left = clusterPanelPos.x + 12;
+          let top = clusterPanelPos.y + 12;
+          if (left + PANEL_W > window.innerWidth - PAD)
+            left = clusterPanelPos.x - PANEL_W - 12;
+          if (left < PAD) left = PAD;
+          if (top + PANEL_H > window.innerHeight - PAD)
+            top = window.innerHeight - PAD - PANEL_H;
+          if (top < PAD) top = PAD;
+          return (
+            <div
+              className="absolute flex flex-col bg-white/95 border border-gray-300 rounded-lg shadow-lg overflow-hidden"
+              style={{ left, top, width: PANEL_W, maxHeight: PANEL_H }}
+            >
+              <div className="px-3 py-2 border-b flex items-center justify-between text-xs font-semibold bg-gray-50">
+                <span>Кластер {activeClusterId}</span>
+                <button
+                  className="text-gray-500 hover:text-gray-800"
+                  onClick={() => {
+                    setActiveClusterId(null);
+                    setClusterLeaves([]);
+                    setClusterPanelPos(null);
+                  }}
+                >
+                  ×
+                </button>
+              </div>
+              <div className="p-2 text-[11px] text-gray-600 border-b">
+                {leavesLoading
+                  ? "Загрузка…"
+                  : `Событий: ${clusterLeaves.length}`}
+              </div>
+              <div className="flex-1 overflow-y-auto text-xs">
+                {clusterLeaves.map((ev) => (
+                  <div
+                    key={ev.id}
+                    className="px-3 py-1.5 border-b last:border-b-0 hover:bg-blue-50 cursor-pointer"
+                  >
+                    <div className="font-medium truncate" title={ev.name}>
+                      {ev.name}
+                    </div>
+                    <div className="text-[10px] text-gray-500">
+                      {ev.lon.toFixed(3)}, {ev.lat.toFixed(3)}
+                    </div>
+                  </div>
+                ))}
+                {!leavesLoading && !clusterLeaves.length && (
+                  <div className="px-3 py-4 text-gray-400 text-center text-[11px]">
+                    Нет событий
+                  </div>
+                )}
+              </div>
+            </div>
+          );
+        })()}
     </div>
   );
 }
